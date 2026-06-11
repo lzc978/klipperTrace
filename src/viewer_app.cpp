@@ -23,9 +23,11 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #endif
 
 namespace {
+constexpr const char* kProjectReleasesUrl = "https://github.com/lzc978/klipperTrace/releases";
 
 std::string trim_copy(std::string s) {
     auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -104,6 +106,18 @@ std::string format_wallclock(double value, bool show_date, bool with_ms) {
     return buf;
 }
 
+std::string analysis_text_for_ui(const std::string& combined, bool zh) {
+    const std::string en_prefix = "EN: ";
+    const std::string cn_sep = "\n中文: ";
+    const std::size_t en_pos = combined.find(en_prefix);
+    const std::size_t cn_pos = combined.find(cn_sep);
+    if (en_pos == std::string::npos || cn_pos == std::string::npos || cn_pos <= en_pos) {
+        return combined;
+    }
+    if (zh) return combined;
+    return combined.substr(en_pos + en_prefix.size(), cn_pos - (en_pos + en_prefix.size()));
+}
+
 ImVec4 stable_series_color(const std::string& key) {
     static const ImVec4 kPalette[] = {
         ImVec4(0.86f, 0.20f, 0.20f, 1.0f), ImVec4(0.20f, 0.45f, 0.86f, 1.0f), ImVec4(0.20f, 0.72f, 0.34f, 1.0f),
@@ -139,6 +153,18 @@ std::vector<SamplePoint> smooth_points(const std::vector<SamplePoint>& src, int 
 
 const char* tr(bool zh, const char* en, const char* cn) {
     return zh ? cn : en;
+}
+
+bool open_url_in_browser(const char* url) {
+#ifdef _WIN32
+    const HINSTANCE r = ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<std::intptr_t>(r) > 32;
+#else
+    std::string cmd = "xdg-open \"";
+    cmd += url;
+    cmd += "\" >/dev/null 2>&1 &";
+    return std::system(cmd.c_str()) == 0;
+#endif
 }
 
 std::string field_cn_label(const std::string& field) {
@@ -250,8 +276,19 @@ void ViewerApp::load_log() {
     rebuild_groups();
     reset_visibility_defaults();
     load_visibility_state();
+    if (!stats_.stats_line_indices.empty()) {
+        select_log_line(stats_.stats_line_indices.front());
+    } else if (!stats_.raw_lines.empty()) {
+        select_log_line(0);
+    } else {
+        selected_log_line_ = static_cast<std::size_t>(-1);
+    }
+    selected_shutdown_index_ = 0;
+    selected_timing_issue_index_ = 0;
     info_ = "Loaded: " + std::to_string(stats_.total_stats_lines) + " Stats lines, " +
-            std::to_string(stats_.series_by_key.size()) + " series.";
+            std::to_string(stats_.series_by_key.size()) + " series, " +
+            std::to_string(stats_.shutdown_events.size()) + " shutdown event(s), " +
+            std::to_string(stats_.timing_issue_events.size()) + " timing issue event(s).";
 
     if (auto_fit_on_load_) {
         request_fit_next_frame_ = true;
@@ -540,6 +577,150 @@ YAxisClass ViewerApp::classify_series(const Series& s) const {
 
 void ViewerApp::setup_axis_limits_from_visible() {}
 
+std::size_t ViewerApp::find_nearest_stats_line_index(double t) const {
+    if (stats_.stats_line_wall_t.empty() || stats_.stats_line_indices.empty()) {
+        return static_cast<std::size_t>(-1);
+    }
+    const auto& ts = stats_.stats_line_wall_t;
+    auto it = std::lower_bound(ts.begin(), ts.end(), t);
+    std::size_t best_i = 0;
+    if (it == ts.end()) {
+        best_i = ts.size() - 1;
+    } else if (it == ts.begin()) {
+        best_i = 0;
+    } else {
+        const std::size_t i = static_cast<std::size_t>(it - ts.begin());
+        const double d0 = std::abs(ts[i] - t);
+        const double d1 = std::abs(ts[i - 1] - t);
+        best_i = (d1 <= d0) ? (i - 1) : i;
+    }
+    if (best_i >= stats_.stats_line_indices.size()) return static_cast<std::size_t>(-1);
+    return stats_.stats_line_indices[best_i];
+}
+
+std::size_t ViewerApp::find_nearest_raw_line_index_by_time(double t) const {
+    if (stats_.raw_line_wall_t.empty()) return stats_.raw_lines.empty() ? static_cast<std::size_t>(-1) : 0;
+    std::size_t best_idx = static_cast<std::size_t>(-1);
+    double best_dist = 1e100;
+    bool best_is_stats = true;
+    int best_severity = -1;  // ERROR(2) > WARN(1) > other(0)
+    for (std::size_t i = 0; i < stats_.raw_line_wall_t.size(); ++i) {
+        const double ts = stats_.raw_line_wall_t[i];
+        if (!std::isfinite(ts)) continue;
+        const double d = std::abs(ts - t);
+        const std::string& line = stats_.raw_lines[i];
+        const bool is_stats = (line.find("Stats ") != std::string::npos);
+        int severity = 0;
+        if (line.find("[ERROR]") != std::string::npos) severity = 2;
+        else if (line.find("[WARN]") != std::string::npos || line.find("[WARNING]") != std::string::npos) severity = 1;
+
+        const bool better_dist = d < best_dist - 1e-9;
+        const bool tie_dist = std::abs(d - best_dist) <= 1e-9;
+        const bool better_kind = tie_dist && (best_is_stats && !is_stats);
+        const bool better_severity = tie_dist && (best_is_stats == is_stats) && (severity > best_severity);
+        if (better_dist || better_kind || better_severity) {
+            best_dist = d;
+            best_idx = i;
+            best_is_stats = is_stats;
+            best_severity = severity;
+        }
+    }
+    if (best_idx != static_cast<std::size_t>(-1)) return best_idx;
+    const std::size_t stats_idx = find_nearest_stats_line_index(t);
+    if (stats_idx != static_cast<std::size_t>(-1)) return stats_idx;
+    return stats_.raw_lines.empty() ? static_cast<std::size_t>(-1) : 0;
+}
+
+void ViewerApp::select_log_line(std::size_t idx) {
+    if (idx == static_cast<std::size_t>(-1) || idx >= stats_.raw_lines.size()) return;
+    selected_log_line_ = idx;
+    if (idx < stats_.raw_line_wall_t.size() && std::isfinite(stats_.raw_line_wall_t[idx])) {
+        selected_time_ = stats_.raw_line_wall_t[idx];
+        return;
+    }
+    if (!stats_.stats_line_indices.empty() && !stats_.stats_line_wall_t.empty()) {
+        auto it = std::lower_bound(stats_.stats_line_indices.begin(), stats_.stats_line_indices.end(), idx);
+        if (it != stats_.stats_line_indices.end()) {
+            const std::size_t pos = static_cast<std::size_t>(it - stats_.stats_line_indices.begin());
+            if (pos < stats_.stats_line_wall_t.size()) {
+                selected_time_ = stats_.stats_line_wall_t[pos];
+            }
+        }
+    }
+}
+
+bool ViewerApp::capture_click_selection_on_axis(YAxisClass axis) {
+    if (!ImPlot::IsPlotHovered() || !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        return false;
+    }
+    (void)axis;
+    const ImPlotPoint mouse = ImPlot::GetPlotMousePos(ImAxis_X1, ImAxis_Y1);
+    if (!std::isfinite(mouse.x)) return false;
+    selected_time_ = mouse.x;
+    const std::size_t idx = find_nearest_raw_line_index_by_time(mouse.x);
+    select_log_line(idx);
+    return idx != static_cast<std::size_t>(-1);
+}
+
+bool ViewerApp::draw_shutdown_markers() {
+    if (stats_.shutdown_events.empty()) return false;
+
+    std::vector<double> xs_other;
+    std::vector<double> xs_selected;
+    xs_other.reserve(stats_.shutdown_events.size());
+    xs_selected.reserve(1);
+    for (std::size_t i = 0; i < stats_.shutdown_events.size(); ++i) {
+        const auto& ev = stats_.shutdown_events[i];
+        if (ev.wall_t <= 0.0) continue;
+        if (i == selected_shutdown_index_) xs_selected.push_back(ev.wall_t);
+        else xs_other.push_back(ev.wall_t);
+    }
+
+    if (!xs_other.empty()) {
+        const ImPlotSpec spec(ImPlotProp_LineColor, ImVec4(1.0f, 0.35f, 0.2f, 0.35f), ImPlotProp_LineWeight, 1.0f);
+        ImPlot::PlotInfLines("shutdown##others", xs_other.data(), static_cast<int>(xs_other.size()), spec);
+    }
+    if (!xs_selected.empty()) {
+        const ImPlotSpec spec(ImPlotProp_LineColor, ImVec4(1.0f, 0.35f, 0.2f, 0.95f), ImPlotProp_LineWeight, 2.6f);
+        ImPlot::PlotInfLines("shutdown##selected", xs_selected.data(), static_cast<int>(xs_selected.size()), spec);
+    }
+
+    if (!ImPlot::IsPlotHovered()) return false;
+    const ImPlotPoint mouse = ImPlot::GetPlotMousePos(ImAxis_X1, ImAxis_Y1);
+    const ImVec2 mp = ImPlot::PlotToPixels(mouse, ImAxis_X1, ImAxis_Y1);
+
+    std::size_t best_idx = static_cast<std::size_t>(-1);
+    float best_dx = 1e9f;
+    for (std::size_t i = 0; i < stats_.shutdown_events.size(); ++i) {
+        const auto& ev = stats_.shutdown_events[i];
+        if (ev.wall_t <= 0.0) continue;
+        const ImVec2 px = ImPlot::PlotToPixels(ImPlotPoint(ev.wall_t, mouse.y), ImAxis_X1, ImAxis_Y1);
+        const float dx = std::abs(px.x - mp.x);
+        if (dx < best_dx) {
+            best_dx = dx;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx == static_cast<std::size_t>(-1) || best_dx > 8.0f) return false;
+    const auto& ev = stats_.shutdown_events[best_idx];
+
+    ImGui::BeginTooltip();
+    ImGui::Text("shutdown #%zu", best_idx + 1);
+    ImGui::Separator();
+    ImGui::TextUnformatted(ev.reason.c_str());
+    ImGui::Text("line: %zu", ev.line_index + 1);
+    ImGui::EndTooltip();
+
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        selected_shutdown_index_ = best_idx;
+        selected_time_ = ev.wall_t;
+        select_log_line(ev.line_index);
+        return true;
+    }
+    return false;
+}
+
 void ViewerApp::draw_hover_tooltip_for_axis(YAxisClass axis) {
     if (!ImPlot::IsPlotHovered()) return;
     const ImPlotPoint mouse = ImPlot::GetPlotMousePos(ImAxis_X1, ImAxis_Y1);
@@ -672,7 +853,11 @@ void ViewerApp::draw_axis_plot(YAxisClass axis, const char* title, const char* y
         }
     }
 
+    const bool clicked_shutdown = draw_shutdown_markers();
     draw_hover_tooltip_for_axis(axis);
+    if (!clicked_shutdown) {
+        capture_click_selection_on_axis(axis);
+    }
     ImPlot::EndPlot();
 }
 
@@ -691,7 +876,9 @@ void ViewerApp::draw_top_bar() {
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(360.0f);
-    const bool enter_pressed = ImGui::InputTextWithHint("##logpath", tr(use_chinese_ui_, "Log path (supports quotes)", "日志路径（支持引号）"),
+    const bool enter_pressed = ImGui::InputTextWithHint(
+        "##logpath",
+        tr(use_chinese_ui_, "Klipper host/MCU related log path only (supports quotes)", "仅支持 Klipper 上下位机相关日志路径（支持引号）"),
                                                          log_path_buf_, sizeof(log_path_buf_), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
     if (ImGui::Button(tr(use_chinese_ui_, "Browse", "浏览"))) browse_log_file();
@@ -702,6 +889,10 @@ void ViewerApp::draw_top_bar() {
     ImGui::SameLine();
     if (ImGui::Button(tr(use_chinese_ui_, "Tools", "工具"))) {
         ImGui::OpenPopup("tools_popup");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr(use_chinese_ui_, "About", "关于"))) {
+        ImGui::OpenPopup("about_popup");
     }
     if (ImGui::BeginPopup("tools_popup")) {
         if (ImGui::MenuItem(tr(use_chinese_ui_, "Fit X", "X轴自适应"))) {
@@ -717,6 +908,26 @@ void ViewerApp::draw_top_bar() {
         ImGui::EndPopup();
     }
     if (enter_pressed) load_log();
+
+    if (ImGui::BeginPopup("about_popup")) {
+        ImGui::TextUnformatted("KlipperTrace");
+        ImGui::Separator();
+        ImGui::TextUnformatted(tr(use_chinese_ui_, "GitHub Releases:", "GitHub 发布页："));
+        ImGui::TextWrapped("%s", kProjectReleasesUrl);
+        if (ImGui::Button(tr(use_chinese_ui_, "Open Link", "打开链接"))) {
+            if (open_url_in_browser(kProjectReleasesUrl)) {
+                info_ = tr(use_chinese_ui_, "Opened GitHub Releases in browser.", "已在浏览器打开 GitHub 发布页。");
+            } else {
+                error_ = tr(use_chinese_ui_, "Failed to open browser.", "打开浏览器失败。");
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr(use_chinese_ui_, "Copy Link", "复制链接"))) {
+            ImGui::SetClipboardText(kProjectReleasesUrl);
+            info_ = tr(use_chinese_ui_, "Releases URL copied to clipboard.", "发布页链接已复制到剪贴板。");
+        }
+        ImGui::EndPopup();
+    }
 
     if (ImGui::BeginPopup("ui_settings_popup")) {
         const char* modes[] = {"File", "Tail File", "Tail Command (SSH)"};
@@ -751,8 +962,6 @@ void ViewerApp::draw_top_bar() {
         ImGui::EndPopup();
     }
 
-    ImGui::TextUnformatted(tr(use_chinese_ui_, "Tip: wheel/drag to zoom and pan. Y-axis ticks adapt with zoom.",
-                              "提示：滚轮/拖拽可缩放平移，Y轴刻度会随缩放自动调整。"));
     ImGui::PopStyleVar(2);
 
     if (!error_.empty()) {
@@ -919,13 +1128,138 @@ void ViewerApp::draw_plot_panel() {
     request_fit_next_frame_ = false;
 }
 
+void ViewerApp::draw_right_panel() {
+    ImGui::TextUnformatted(tr(use_chinese_ui_, "Log Context", "日志上下文"));
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SliderInt(tr(use_chinese_ui_, "Context lines", "上下文行数"), &context_radius_, 50, 100);
+
+    if (!stats_.raw_lines.empty() && selected_log_line_ >= stats_.raw_lines.size()) {
+        select_log_line(0);
+    }
+
+    if (!stats_.raw_lines.empty() && selected_log_line_ < stats_.raw_lines.size()) {
+        const std::string ts = format_wallclock(selected_time_, true, true);
+        ImGui::Text("%s: %s", tr(use_chinese_ui_, "Selected time", "选中时间"), ts.c_str());
+        ImGui::Text("%s: %zu", tr(use_chinese_ui_, "Selected line", "选中行"), selected_log_line_ + 1);
+    } else {
+        ImGui::TextUnformatted(tr(use_chinese_ui_, "Click a point in any plot to locate source log line.",
+                                  "点击图表中的点，可定位到原始日志行。"));
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader(tr(use_chinese_ui_, "Shutdown Analysis", "Shutdown分析"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (stats_.shutdown_events.empty()) {
+            ImGui::TextUnformatted(tr(use_chinese_ui_, "No shutdown events detected.", "未检测到shutdown事件。"));
+        } else {
+            int ev_idx = static_cast<int>(std::min(selected_shutdown_index_, stats_.shutdown_events.size() - 1));
+            std::vector<std::string> labels;
+            labels.reserve(stats_.shutdown_events.size());
+            for (std::size_t i = 0; i < stats_.shutdown_events.size(); ++i) {
+                const auto& ev = stats_.shutdown_events[i];
+                labels.push_back("#" + std::to_string(i + 1) + " L" + std::to_string(ev.line_index + 1) + " " + ev.reason);
+            }
+            auto getter = [](void* data, int idx) -> const char* {
+                auto* items = static_cast<std::vector<std::string>*>(data);
+                if (idx < 0 || static_cast<std::size_t>(idx) >= items->size()) return "";
+                return (*items)[static_cast<std::size_t>(idx)].c_str();
+            };
+            if (ImGui::Combo("##shutdown_select", &ev_idx, getter, &labels, static_cast<int>(labels.size()))) {
+                selected_shutdown_index_ = static_cast<std::size_t>(ev_idx);
+                select_log_line(stats_.shutdown_events[selected_shutdown_index_].line_index);
+            }
+            selected_shutdown_index_ = static_cast<std::size_t>(ev_idx);
+
+            const auto& ev = stats_.shutdown_events[selected_shutdown_index_];
+            const std::string ui_analysis = analysis_text_for_ui(ev.analysis, use_chinese_ui_);
+            ImGui::TextWrapped("%s", ui_analysis.c_str());
+            if (ImGui::Button(tr(use_chinese_ui_, "Jump to shutdown line", "跳转到shutdown行"))) {
+                select_log_line(ev.line_index);
+            }
+            ImGui::Separator();
+            ImGui::TextUnformatted(tr(use_chinese_ui_, "Dump excerpt", "Dump摘录"));
+            ImGui::BeginChild("shutdown_dump", ImVec2(0, 180), true);
+            for (const auto& s : ev.dump_lines) {
+                ImGui::TextUnformatted(s.c_str());
+            }
+            ImGui::EndChild();
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader(tr(use_chinese_ui_, "Timing/Jitter Analysis", "时序/抖动分析"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (stats_.timing_issue_events.empty()) {
+            ImGui::TextUnformatted(tr(use_chinese_ui_, "No timing issue event detected.",
+                                      "未检测到 time too close / scheduling 类事件。"));
+        } else {
+            int idx = static_cast<int>(std::min(selected_timing_issue_index_, stats_.timing_issue_events.size() - 1));
+            std::vector<std::string> labels;
+            labels.reserve(stats_.timing_issue_events.size());
+            for (std::size_t i = 0; i < stats_.timing_issue_events.size(); ++i) {
+                const auto& ev = stats_.timing_issue_events[i];
+                labels.push_back("#" + std::to_string(i + 1) + " L" + std::to_string(ev.line_index + 1) + " " + ev.type);
+            }
+            auto getter = [](void* data, int i) -> const char* {
+                auto* items = static_cast<std::vector<std::string>*>(data);
+                if (i < 0 || static_cast<std::size_t>(i) >= items->size()) return "";
+                return (*items)[static_cast<std::size_t>(i)].c_str();
+            };
+            if (ImGui::Combo("##timing_issue_select", &idx, getter, &labels, static_cast<int>(labels.size()))) {
+                selected_timing_issue_index_ = static_cast<std::size_t>(idx);
+                const auto& ev = stats_.timing_issue_events[selected_timing_issue_index_];
+                selected_time_ = ev.wall_t;
+                select_log_line(ev.line_index);
+            }
+            selected_timing_issue_index_ = static_cast<std::size_t>(idx);
+
+            const auto& ev = stats_.timing_issue_events[selected_timing_issue_index_];
+            const std::string ui_analysis = analysis_text_for_ui(ev.analysis, use_chinese_ui_);
+            ImGui::TextWrapped("%s", ui_analysis.c_str());
+            if (ImGui::Button(tr(use_chinese_ui_, "Jump to timing issue line", "跳转到时序问题行"))) {
+                selected_time_ = ev.wall_t;
+                select_log_line(ev.line_index);
+            }
+            ImGui::SameLine();
+            ImGui::Text("%s: %zu", tr(use_chinese_ui_, "line", "行"), ev.line_index + 1);
+            ImGui::BeginChild("timing_issue_line", ImVec2(0, 86), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(ev.line_text.c_str());
+            ImGui::EndChild();
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(tr(use_chinese_ui_, "Selected Full Log Context", "选中完整日志上下文"));
+    ImGui::BeginChild("log_context", ImVec2(0, 360), true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (stats_.raw_lines.empty()) {
+        ImGui::TextUnformatted(tr(use_chinese_ui_, "No raw log lines available.", "没有可显示的原始日志。"));
+    } else if (selected_log_line_ >= stats_.raw_lines.size()) {
+        ImGui::TextUnformatted(tr(use_chinese_ui_, "No line selected.", "尚未选择日志行。"));
+    } else {
+        const std::size_t begin = (selected_log_line_ > static_cast<std::size_t>(context_radius_))
+                                      ? (selected_log_line_ - static_cast<std::size_t>(context_radius_))
+                                      : 0;
+        const std::size_t end =
+            std::min(stats_.raw_lines.size(), selected_log_line_ + static_cast<std::size_t>(context_radius_) + 1);
+        for (std::size_t i = begin; i < end; ++i) {
+            if (i == selected_log_line_) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.25f, 1.0f));
+                ImGui::Text("%8zu > %s", i + 1, stats_.raw_lines[i].c_str());
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::Text("%8zu   %s", i + 1, stats_.raw_lines[i].c_str());
+            }
+        }
+    }
+    ImGui::EndChild();
+}
+
 void ViewerApp::draw_ui() {
     draw_top_bar();
     ImGui::Separator();
 
-    if (ImGui::BeginTable("main_layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("SeriesPanel", ImGuiTableColumnFlags_WidthFixed, 360.0f);
-        ImGui::TableSetupColumn("PlotPanel", ImGuiTableColumnFlags_WidthStretch);
+    if (ImGui::BeginTable("main_layout", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("SeriesPanel", ImGuiTableColumnFlags_WidthFixed, 320.0f);
+        ImGui::TableSetupColumn("PlotPanel", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+        ImGui::TableSetupColumn("RightPanel", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
@@ -936,6 +1270,11 @@ void ViewerApp::draw_ui() {
         ImGui::TableSetColumnIndex(1);
         ImGui::BeginChild("plot_panel", ImVec2(0.0f, 0.0f), false);
         draw_plot_panel();
+        ImGui::EndChild();
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::BeginChild("right_panel", ImVec2(0.0f, 0.0f), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        draw_right_panel();
         ImGui::EndChild();
 
         ImGui::EndTable();

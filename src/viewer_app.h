@@ -50,6 +50,7 @@ private:
     void draw_top_bar();
     void draw_left_panel();
     void draw_plot_panel();
+    void draw_right_panel();
     void draw_axis_plot(YAxisClass axis, const char* title, const char* y_label, const ImVec2& size);
     void load_log();
     void reset_visibility_defaults();
@@ -67,6 +68,11 @@ private:
     YAxisClass classify_series(const Series& s) const;
     void setup_axis_limits_from_visible();
     void draw_hover_tooltip_for_axis(YAxisClass axis);
+    bool capture_click_selection_on_axis(YAxisClass axis);
+    bool draw_shutdown_markers();
+    std::size_t find_nearest_raw_line_index_by_time(double t) const;
+    std::size_t find_nearest_stats_line_index(double t) const;
+    void select_log_line(std::size_t idx);
 
     LogParser parser_;
     ParsedStats stats_;
@@ -101,4 +107,9 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> group_to_keys_;
     std::vector<std::string> group_order_;
     std::unordered_map<std::string, YAxisClass> axis_override_by_key_;
+    std::size_t selected_log_line_ = static_cast<std::size_t>(-1);
+    double selected_time_ = 0.0;
+    std::size_t selected_shutdown_index_ = 0;
+    std::size_t selected_timing_issue_index_ = 0;
+    int context_radius_ = 80;
 };
