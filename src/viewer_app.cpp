@@ -206,6 +206,17 @@ std::string group_cn_label(const std::string& group) {
     return it->second;
 }
 
+#ifdef _WIN32
+std::string wide_to_utf8(const std::wstring& ws) {
+    if (ws.empty()) return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1) return {};
+    std::string out(static_cast<std::size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+#endif
+
 }  // namespace
 
 ViewerApp::ViewerApp() {
@@ -523,16 +534,18 @@ void ViewerApp::export_csv() {
 
 bool ViewerApp::browse_log_file() {
 #ifdef _WIN32
-    char path_buf[1024] = {0};
-    OPENFILENAMEA ofn = {};
+    wchar_t path_buf[1024] = {0};
+    wchar_t filter_buf[] = L"Log Files\0*.log;*.txt\0All Files\0*.*\0";
+    OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFile = path_buf;
-    ofn.nMaxFile = sizeof(path_buf);
-    ofn.lpstrFilter = "Log Files\0*.log;*.txt\0All Files\0*.*\0";
+    ofn.nMaxFile = static_cast<DWORD>(sizeof(path_buf) / sizeof(path_buf[0]));
+    ofn.lpstrFilter = filter_buf;
     ofn.nFilterIndex = 1;
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-    if (GetOpenFileNameA(&ofn) == TRUE) {
-        std::snprintf(log_path_buf_, sizeof(log_path_buf_), "%s", path_buf);
+    if (GetOpenFileNameW(&ofn) == TRUE) {
+        const std::string utf8_path = wide_to_utf8(path_buf);
+        std::snprintf(log_path_buf_, sizeof(log_path_buf_), "%s", utf8_path.c_str());
         return true;
     }
 #endif
